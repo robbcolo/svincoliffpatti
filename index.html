@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Svincoli Segreti — FantaFanta Patti</title>
 <style>
+
 :root {
   --bg: #f6f7f9;
   --card: #ffffff;
@@ -206,6 +207,7 @@ tr:last-child td { border-bottom: none; }
   font-size: 16px;
 }
 
+
 </style>
 </head>
 <body>
@@ -327,6 +329,15 @@ function escapeHtml(s) {
 //    squadra ogni 3 colonne (nome, costo, colonna vuota), una riga per
 //    ogni giocatore nella stessa colonna, riga finale "totale".
 // 2) "semplice": una riga per squadra, colonne "squadra,giocatore1,giocatore2,...".
+// Ogni giocatore diventa un oggetto {nome, costo, exListone}: exListone è
+// true se il nome nel file ha un asterisco finale (es. "Suzuki *"), cioè
+// il giocatore non è più nel listone principale (andato all'estero, ecc.).
+function parseGiocatoreCella(testo) {
+  const t = testo.trim();
+  const exListone = /\*\s*$/.test(t);
+  const nome = t.replace(/\*\s*$/, "").trim();
+  return { nome, exListone };
+}
 function parseRosterCsv(text) {
   const righe = text.split(/\r?\n/).filter((r) => r.trim() !== "");
   if (righe.length === 0) return {};
@@ -340,7 +351,8 @@ function parseRosterCsv(text) {
 function parseRosterCsvAmpio(righe) {
   const intestazione = righe[0].split(",");
   // Le colonne "squadra" sono quelle il cui valore nell'intestazione non
-  // è vuoto e non è "costo" (che è invece la colonna accanto al nome).
+  // è vuoto e non è "costo" (che è invece la colonna accanto al nome,
+  // cioè idx+1).
   const colonneSquadra = [];
   intestazione.forEach((cella, idx) => {
     const v = cella.trim();
@@ -352,10 +364,14 @@ function parseRosterCsvAmpio(righe) {
 
   for (let r = 1; r < righe.length; r++) {
     const celle = righe[r].split(",");
-    for (const { idx, nome } of colonneSquadra) {
-      const giocatore = (celle[idx] || "").trim();
-      if (giocatore && giocatore.toLowerCase() !== "totale") {
-        if (!risultato[nome].includes(giocatore)) risultato[nome].push(giocatore);
+    for (const { idx, nome: nomeSquadra } of colonneSquadra) {
+      const grezzo = (celle[idx] || "").trim();
+      if (!grezzo || grezzo.toLowerCase() === "totale") continue;
+      const { nome, exListone } = parseGiocatoreCella(grezzo);
+      if (!nome) continue;
+      const costo = parseInt((celle[idx + 1] || "0").trim(), 10) || 0;
+      if (!risultato[nomeSquadra].some((g) => g.nome === nome)) {
+        risultato[nomeSquadra].push({ nome, costo, exListone });
       }
     }
   }
@@ -367,15 +383,42 @@ function parseRosterCsvSemplice(righe) {
   for (const riga of righe) {
     const parti = riga.split(",").map((p) => p.trim()).filter(Boolean);
     if (parti.length < 2) continue;
-    const [squadra, ...giocatori] = parti;
+    const [squadra, ...giocatoriGrezzi] = parti;
     if (squadra.toLowerCase() === "squadra") continue; // riga di intestazione
     if (!risultato[squadra]) risultato[squadra] = [];
-    for (const g of giocatori) {
-      if (!risultato[squadra].includes(g)) risultato[squadra].push(g);
+    for (const grezzo of giocatoriGrezzi) {
+      const { nome, exListone } = parseGiocatoreCella(grezzo);
+      if (nome && !risultato[squadra].some((g) => g.nome === nome)) {
+        risultato[squadra].push({ nome, costo: 0, exListone });
+      }
     }
   }
   return risultato;
 }
+
+// ===== Calcolo crediti e valore di svincolo =====
+// Valore di svincolo: metà del valore d'acquisto (arrotondata per eccesso)
+// per i giocatori ancora nel listone; l'intero valore d'acquisto per quelli
+// fuori listone (contrassegnati con l'asterisco nel file).
+function valoreSvincolo(giocatore) {
+  if (giocatore.exListone) return giocatore.costo;
+  return Math.ceil(giocatore.costo / 2);
+}
+// Crediti rimasti prima di qualunque svincolo: 500 meno il costo
+// complessivo della rosa così come risulta dal file caricato dall'admin.
+function creditiBase(rosa) {
+  const totaleCosto = rosa.reduce((s, g) => s + (g.costo || 0), 0);
+  return 500 - totaleCosto;
+}
+// Crediti disponibili se si confermano gli svincoli selezionati: crediti
+// base più il valore di svincolo di ogni giocatore scelto.
+function creditiConSvincoli(rosa, nomiSelezionati) {
+  const bonus = rosa
+    .filter((g) => nomiSelezionati.includes(g.nome))
+    .reduce((s, g) => s + valoreSvincolo(g), 0);
+  return creditiBase(rosa) + bonus;
+}
+
 
 // ===== Wrapper storage: Firestore =====
 // Mappatura chiave -> percorso Firestore:
@@ -418,6 +461,15 @@ async function sGet(key) {
 async function sSet(key, value) {
   await firestoreRefFor(key).set(value);
   return true;
+}
+async function sDelete(key) {
+  try {
+    await firestoreRefFor(key).delete();
+    return true;
+  } catch (e) {
+    console.error("sDelete fallita per", key, e);
+    return false;
+  }
 }
 async function sListWithData(prefix) {
   try {
@@ -647,6 +699,21 @@ function normalizzaFinestra(raw) {
 function isOpen(finestra, now = new Date()) {
   return now < finestra.deadlineDate;
 }
+// Elimina una finestra e tutto ciò che le appartiene: Firestore non
+// cancella da solo le sottocollezioni di un documento, quindi vanno
+// rimosse una per una prima del documento principale.
+async function deleteFinestraCompleta(finestraId) {
+  const [righeStato, righeInvii] = await Promise.all([
+    sListWithData(`stato:${finestraId}:`),
+    sListWithData(`invio:${finestraId}:`),
+  ]);
+  await Promise.all([
+    ...righeStato.map((r) => sDelete(r.key)),
+    ...righeInvii.map((r) => sDelete(r.key)),
+    sDelete("roster:" + finestraId),
+  ]);
+  await sDelete("finestra:" + finestraId);
+}
 
 async function renderDashboard(mySeq) {
   if (!STATE.session || STATE.session.type !== "team") return navigate("teamLogin");
@@ -770,8 +837,12 @@ async function renderSubmit(mySeq, finestraId) {
 
   const rosterAll = rosterAllRaw || {};
   const rosaGrezza = rosterAll[nome] || [];
-  const rosa = rosaGrezza.flatMap((g) => String(g).split(",").map((s) => s.trim()).filter(Boolean));
+  // Compatibilità: rose salvate prima di questo aggiornamento erano un
+  // semplice elenco di nomi (stringhe) invece che oggetti con costo.
+  const rosa = rosaGrezza.map((g) => (typeof g === "string" ? { nome: g, costo: 0, exListone: false } : g));
   if (stale(mySeq)) return;
+
+  const base = creditiBase(rosa);
 
   app().innerHTML = `
     <h1>${escapeHtml(finestra.label)}</h1>
@@ -780,18 +851,26 @@ async function renderSubmit(mySeq, finestraId) {
       fino all'orario dell'asta. Puoi cambiare idea e reinviare finché non scade il tempo.
     </p>
     ${invioEsistente ? `<div class="ok">Hai già inviato una lista. Se invii di nuovo, sostituisce quella di prima.</div>` : ""}
+
+    <div class="card">
+      <div class="countdown-label">Crediti se confermi questi svincoli</div>
+      <div class="countdown" id="creditiValore">${base}</div>
+      <p class="footnote">Crediti attuali (senza svincoli): ${base} · budget iniziale 500</p>
+    </div>
+
     <div class="card">
       <h3>La tua rosa</h3>
       ${rosa.length ? `
         <div class="checklist" id="rosaList">
-          ${rosa.map((g) => `<label class="checkitem"><input type="checkbox" value="${escapeHtml(g)}"> ${escapeHtml(g)}</label>`).join("")}
-        </div>` : `<p class="empty-state">L'admin non ha ancora caricato la tua rosa.<br>Scrivi pure i nomi qui sotto.</p>`}
-
-      <label for="manuale">Altri nomi (uno per riga, se serve)</label>
-      <textarea id="manuale" rows="3" placeholder="Es. giocatori non in rosa o andati all'estero"></textarea>
-
-      <label for="minDichiarato">Quanti svincoli fai in totale? (di solito da 0 a 5, di più solo se hai giocatori andati all'estero)</label>
-      <input type="number" id="minDichiarato" min="0" value="0">
+          ${rosa.map((g) => `
+            <label class="checkitem">
+              <input type="checkbox" value="${escapeHtml(g.nome)}">
+              <div style="flex:1">
+                <div>${escapeHtml(g.nome)}${g.exListone ? ' <span class="badge attesa">fuori listone</span>' : ""}</div>
+                <div class="footnote">Acquistato a ${g.costo} · Svincolo: ${valoreSvincolo(g)} crediti${g.exListone ? " (valore intero, fuori listone)" : " (metà, arrotondata per eccesso)"}</div>
+              </div>
+            </label>`).join("")}
+        </div>` : `<p class="empty-state">L'admin non ha ancora caricato la tua rosa per questa finestra.</p>`}
 
       <div id="formErr" class="err" style="display:none"></div>
       <div id="formOk" class="ok" style="display:none"></div>
@@ -802,19 +881,23 @@ async function renderSubmit(mySeq, finestraId) {
     <button class="secondary" data-go="dashboard">← Torna alla home</button>`;
   wireGoButtons();
 
+  function ricalcolaCrediti() {
+    const selezionati = Array.from(app().querySelectorAll('#rosaList input:checked')).map((el) => el.value);
+    document.getElementById("creditiValore").textContent = creditiConSvincoli(rosa, selezionati);
+  }
+  const listaEl = document.getElementById("rosaList");
+  if (listaEl) listaEl.addEventListener("change", ricalcolaCrediti);
+
   document.getElementById("btnInvia").addEventListener("click", async () => {
     const errBox = document.getElementById("formErr");
     const okBox = document.getElementById("formOk");
     const btn = document.getElementById("btnInvia");
     errBox.style.display = "none"; okBox.style.display = "none";
 
-    const selezionati = Array.from(app().querySelectorAll('#rosaList input:checked')).map((el) => el.value);
-    const manuale = document.getElementById("manuale").value.split("\n").map((s) => s.trim()).filter(Boolean);
-    const giocatori = selezionati.concat(manuale);
-    const numeroDichiarato = parseInt(document.getElementById("minDichiarato").value || "0", 10);
+    const giocatori = Array.from(app().querySelectorAll('#rosaList input:checked')).map((el) => el.value);
 
     if (giocatori.length === 0) {
-      errBox.textContent = "Scegli o scrivi almeno un giocatore.";
+      errBox.textContent = "Scegli almeno un giocatore da svincolare.";
       errBox.style.display = "block";
       return;
     }
@@ -823,8 +906,9 @@ async function renderSubmit(mySeq, finestraId) {
     btn.textContent = "Invio…";
     try {
       const adesso = new Date().toISOString();
+      const creditiFinali = creditiConSvincoli(rosa, giocatori);
       await Promise.all([
-        sSet(`invio:${finestraId}:${nome}`, { giocatori, numeroDichiarato, submittedAtIso: adesso }),
+        sSet(`invio:${finestraId}:${nome}`, { giocatori, creditiFinali, submittedAtIso: adesso }),
         sSet(`stato:${finestraId}:${nome}`, { submitted: true, submittedAtIso: adesso }),
       ]);
       okBox.textContent = "Fatto! La tua lista è stata inviata.";
@@ -901,7 +985,7 @@ function mostraRivelazione(root, righeInvio, finestraId) {
         <h3>${escapeHtml(teamName)}</h3>
         <div class="footnote">Inviato: ${data.submittedAtIso ? formatRoma(data.submittedAtIso) : "—"}</div>
         <ul class="reveal-list">${giocatori.map((g) => `<li>${escapeHtml(g)}</li>`).join("")}</ul>
-        ${data.numeroDichiarato !== undefined ? `<div class="footnote">Numero dichiarato: ${escapeHtml(data.numeroDichiarato)}</div>` : ""}
+        ${data.creditiFinali !== undefined ? `<div class="footnote">Crediti dopo questi svincoli: ${escapeHtml(data.creditiFinali)}</div>` : ""}
       </div>`;
     })
     .join("");
@@ -959,11 +1043,22 @@ async function renderAdminDashboard(mySeq) {
           <td style="text-align:right">
             ${isOpen(f, now) ? '<span class="badge attesa">Aperta</span>' : '<span class="badge si">Chiusa</span>'}
           </td>
+          <td style="text-align:right"><button class="danger" data-elimina-finestra="${f.id}">Elimina</button></td>
         </tr>`).join("")}</tbody>
     </table></div>` : `<div class="card empty-state">Non hai ancora creato nessuna finestra.</div>`}`;
   wireGoButtons();
   app().querySelectorAll("[data-go-detail]").forEach((el) =>
     el.addEventListener("click", (e) => { e.preventDefault(); navigate("adminFinestraDetail", { finestraId: el.dataset.goDetail }); })
+  );
+  app().querySelectorAll("[data-elimina-finestra]").forEach((el) =>
+    el.addEventListener("click", async () => {
+      const id = el.dataset.eliminaFinestra;
+      if (!confirm("Eliminare questa finestra e tutti gli invii che contiene? Non si può annullare.")) return;
+      el.disabled = true;
+      await deleteFinestraCompleta(id);
+      if (stale(mySeq)) return;
+      await navigate("adminDashboard");
+    })
   );
 }
 
@@ -1026,7 +1121,8 @@ async function renderAdminFinestraDetail(mySeq, finestraId) {
 
     <h2>Rosa delle squadre</h2>
     <div class="card">
-      <p class="footnote">${rosaCaricata ? "Hai già caricato una rosa per questa finestra. Se la ricarichi, sostituisce quella vecchia." : "Non hai ancora caricato la rosa — le squadre potranno comunque scrivere i nomi a mano."}</p>
+      <p class="footnote">${rosaCaricata ? "Hai già caricato una rosa per questa finestra. Se la ricarichi, sostituisce quella vecchia." : "Non hai ancora caricato la rosa — le squadre non potranno inviare finché non lo fai."}</p>
+      <p class="footnote">Se nel file c'è una squadra che non hai ancora creato, viene creata da sola con un PIN di partenza, che ti mostro qui sotto dopo il caricamento.</p>
       <label for="csvInput">Incolla qui l'elenco (una squadra per riga: <span style="font-family:monospace">nome squadra, giocatore1, giocatore2, ...</span>)</label>
       <textarea id="csvInput" rows="8" placeholder="Rossoneri FC,Mario Rossi,Luigi Bianchi&#10;Gli Invincibili,Marco Verdi"></textarea>
       <p class="footnote">Oppure carica un file .csv:</p>
@@ -1049,17 +1145,41 @@ async function renderAdminFinestraDetail(mySeq, finestraId) {
   });
 
   document.getElementById("btnImportaCsv").addEventListener("click", async () => {
+    const btnImporta = document.getElementById("btnImportaCsv");
     const testo = document.getElementById("csvInput").value;
     const parsed = parseRosterCsv(testo);
+    btnImporta.disabled = true;
+    btnImporta.textContent = "Un attimo…";
+
+    // Crea automaticamente le squadre che compaiono nel file e non
+    // esistono ancora, con un PIN di partenza generato al momento —
+    // così non serve crearle a mano una per una (rischio di errori nei nomi).
+    const nomiSquadreCsv = Object.keys(parsed);
+    const squadreEsistenti = new Set(tutteLeSquadre);
+    const nuovePin = [];
+    for (const nome of nomiSquadreCsv) {
+      if (squadreEsistenti.has(nome)) continue;
+      const pin = randomPin4();
+      const { hash, salt } = await hashPin(pin);
+      await sSet("team:" + nome, { pinHash: hash, pinSalt: salt, pinChanged: false, createdAtIso: new Date().toISOString() });
+      nuovePin.push({ nome, pin });
+    }
+
     await sSet("roster:" + finestraId, parsed);
     if (stale(mySeq)) return;
+
     const msg = document.getElementById("csvMsg");
-    const nSquadre = Object.keys(parsed).length;
+    const nSquadre = nomiSquadreCsv.length;
     const nGiocatori = Object.values(parsed).reduce((a, arr) => a + arr.length, 0);
-    const nonRiconosciute = Object.keys(parsed).filter((s) => !tutteLeSquadre.includes(s));
-    msg.textContent = `Caricati ${nGiocatori} giocatori per ${nSquadre} squadre.` +
-      (nonRiconosciute.length ? ` Attenzione, questi nomi non corrispondono a nessuna squadra creata: ${nonRiconosciute.join(", ")}` : "");
+    let html = `Caricati ${nGiocatori} giocatori per ${nSquadre} squadre.`;
+    if (nuovePin.length) {
+      html += ` Create ${nuovePin.length} nuove squadre con questi PIN di partenza — comunicali alle squadre:<br>`;
+      html += nuovePin.map((s) => `${escapeHtml(s.nome)}: <b>${escapeHtml(s.pin)}</b>`).join("<br>");
+    }
+    msg.innerHTML = html;
     msg.style.display = "block";
+    btnImporta.disabled = false;
+    btnImporta.textContent = "Carica rosa";
   });
 }
 
@@ -1102,7 +1222,10 @@ async function renderAdminTeams(mySeq) {
           <tr>
             <td>${escapeHtml(s.name)}</td>
             <td>${s.pinChanged ? '<span class="badge si">PIN personale</span>' : '<span class="badge attesa">PIN di partenza</span>'}</td>
-            <td style="text-align:right"><button class="danger" data-reset="${escapeHtml(s.name)}">Nuovo PIN</button></td>
+            <td style="text-align:right">
+              <button class="secondary" data-reset="${escapeHtml(s.name)}">Nuovo PIN</button>
+              <button class="danger" data-elimina-squadra="${escapeHtml(s.name)}">Elimina</button>
+            </td>
           </tr>`).join("")}
       </tbody></table>
     </div>`;
@@ -1135,6 +1258,17 @@ async function renderAdminTeams(mySeq) {
       await sSet("team:" + nome, { ...existing, pinHash: hash, pinSalt: salt, pinChanged: false });
       if (stale(mySeq)) return;
       alert(`Nuovo PIN per "${nome}": ${nuovoPin}\nComunicalo alla squadra.`);
+      await navigate("adminTeams");
+    });
+  });
+
+  app().querySelectorAll("[data-elimina-squadra]").forEach((el) => {
+    el.addEventListener("click", async () => {
+      const nome = el.dataset.eliminaSquadra;
+      if (!confirm(`Eliminare la squadra "${nome}"? Non si può annullare. Gli invii già fatti da questa squadra restano nelle finestre esistenti, ma non potrà più accedere.`)) return;
+      el.disabled = true;
+      await sDelete("team:" + nome);
+      if (stale(mySeq)) return;
       await navigate("adminTeams");
     });
   });
