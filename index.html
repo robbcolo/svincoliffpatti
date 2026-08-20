@@ -214,6 +214,7 @@ tr:last-child td { border-bottom: none; }
   <script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-app-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-firestore-compat.js"></script>
   <script>
+
 // ============================================================
 // CONFIGURAZIONE FIREBASE — DA COMPILARE PRIMA DI PUBBLICARE
 // ============================================================
@@ -320,8 +321,48 @@ function escapeHtml(s) {
 }
 
 // ===== Parser CSV (colonne: squadra,giocatore — o più giocatori sulla stessa riga) =====
+// ===== Parser CSV rose =====
+// Riconosce due formati:
+// 1) "a colonne" (esportazione tipica dei listoni): intestazione con nome
+//    squadra ogni 3 colonne (nome, costo, colonna vuota), una riga per
+//    ogni giocatore nella stessa colonna, riga finale "totale".
+// 2) "semplice": una riga per squadra, colonne "squadra,giocatore1,giocatore2,...".
 function parseRosterCsv(text) {
-  const righe = text.split("\n").map((r) => r.trim()).filter(Boolean);
+  const righe = text.split(/\r?\n/).filter((r) => r.trim() !== "");
+  if (righe.length === 0) return {};
+
+  const primaRiga = righe[0].split(",");
+  const sembraFormatoAmpio = primaRiga.some((c) => c.trim().toLowerCase() === "costo");
+
+  return sembraFormatoAmpio ? parseRosterCsvAmpio(righe) : parseRosterCsvSemplice(righe);
+}
+
+function parseRosterCsvAmpio(righe) {
+  const intestazione = righe[0].split(",");
+  // Le colonne "squadra" sono quelle il cui valore nell'intestazione non
+  // è vuoto e non è "costo" (che è invece la colonna accanto al nome).
+  const colonneSquadra = [];
+  intestazione.forEach((cella, idx) => {
+    const v = cella.trim();
+    if (v && v.toLowerCase() !== "costo") colonneSquadra.push({ idx, nome: v });
+  });
+
+  const risultato = {};
+  for (const { nome } of colonneSquadra) risultato[nome] = [];
+
+  for (let r = 1; r < righe.length; r++) {
+    const celle = righe[r].split(",");
+    for (const { idx, nome } of colonneSquadra) {
+      const giocatore = (celle[idx] || "").trim();
+      if (giocatore && giocatore.toLowerCase() !== "totale") {
+        if (!risultato[nome].includes(giocatore)) risultato[nome].push(giocatore);
+      }
+    }
+  }
+  return risultato;
+}
+
+function parseRosterCsvSemplice(righe) {
   const risultato = {};
   for (const riga of righe) {
     const parti = riga.split(",").map((p) => p.trim()).filter(Boolean);
@@ -1102,6 +1143,7 @@ async function renderAdminTeams(mySeq) {
 // ===================== Avvio =====================
 navigate("home");
 
+  
   </script>
 </body>
 </html>
